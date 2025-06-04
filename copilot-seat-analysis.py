@@ -4,6 +4,9 @@ import logging
 import time
 import os
 
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
 # Fetch the personal access token from environment variable
 personal_access_token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
 
@@ -14,8 +17,6 @@ if not personal_access_token:
 
 # Setup for resilient HTTP requests
 session = requests.Session()
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
 retry = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retry)
 session.mount('http://', adapter)
@@ -43,11 +44,11 @@ headers = ["Organization", "Username", "Email", "Created At", "Last Activity At"
 def get_user_teams(org_name, session, token):
     user_teams = {}
     teams_url = f"https://api.github.com/orgs/{org_name}/teams"
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    headers_local = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     page = 1
     while True:
         paged_teams_url = f"{teams_url}?per_page=100&page={page}"
-        teams_response = session.get(paged_teams_url, headers=headers)
+        teams_response = session.get(paged_teams_url, headers=headers_local)
         if teams_response.status_code != 200:
             break
         teams = teams_response.json()
@@ -62,7 +63,7 @@ def get_user_teams(org_name, session, token):
             members_page = 1
             while True:
                 paged_members_url = f"{members_url}?per_page=100&page={members_page}"
-                members_response = session.get(paged_members_url, headers=headers)
+                members_response = session.get(paged_members_url, headers=headers_local)
                 if members_response.status_code != 200:
                     break
                 members = members_response.json()
@@ -107,30 +108,31 @@ with open('copilot-seat-analysis.csv', 'w', newline='') as file:
             # Build user-to-teams mapping for the org
             user_teams_map = get_user_teams(org_name, session, personal_access_token)
 
-            # Fetch Copilot seat assignments
-            seats_response = session.get(
-                f"https://api.github.com/orgs/{org_name}/copilot/billing/seats",
-                headers={"Authorization": f"Bearer {personal_access_token}", "Accept": "application/vnd.github+json"}
-            )
-            if seats_response.status_code == 200:
-                seats_data = seats_response.json()
-                if "seats" in seats_data:
-                    for seat in seats_data["seats"]:
-                        username = seat.get("assignee", {}).get("login", "N/A")
-                        email = get_user_details(username, session, personal_access_token)
-                        created_at = seat.get("created_at", "N/A")
-                        last_activity_at = seat.get("last_activity_at", "N/A")
-                        pending_cancellation_date = seat.get("pending_cancellation_date", "N/A")
-
-                        # Get team names from user_teams_map
-                        team_names = ", ".join(user_teams_map.get(username, [])) if username in user_teams_map else "null"
-
-                        writer.writerow([org_name, username, email, created_at, last_activity_at, pending_cancellation_date, team_names])
-                        logging.debug(f'Wrote seat data for user: {username}, team: {team_names}, email: {email}')
+            # Fetch Copilot seat assignments with pagination
+            page = 1
+            while True:
+                seats_response = session.get(
+                    f"https://api.github.com/orgs/{org_name}/copilot/billing/seats?per_page=100&page={page}",
+                    headers={"Authorization": f"Bearer {personal_access_token}", "Accept": "application/vnd.github+json"}
+                )
+                if seats_response.status_code == 200:
+                    seats_data = seats_response.json()
+                    if "seats" in seats_data and seats_data["seats"]:
+                        for seat in seats_data["seats"]:
+                            username = seat.get("assignee", {}).get("login", "N/A")
+                            email = get_user_details(username, session, personal_access_token)
+                            created_at = seat.get("created_at", "N/A")
+                            last_activity_at = seat.get("last_activity_at", "N/A")
+                            pending_cancellation_date = seat.get("pending_cancellation_date", "N/A")
+                            team_names = ", ".join(user_teams_map.get(username, [])) if username in user_teams_map else "null"
+                            writer.writerow([org_name, username, email, created_at, last_activity_at, pending_cancellation_date, team_names])
+                            logging.debug(f'Wrote seat data for user: {username}, team: {team_names}, email: {email}')
+                        page += 1
+                    else:
+                        break
                 else:
-                    logging.warning(f"No seat data found for organization: {org_name}")
-            else:
-                logging.error(f"Failed to fetch seat information for {org_name}: {seats_response.status_code} - {seats_response.text}")
+                    logging.error(f"Failed to fetch seat information for {org_name}: {seats_response.status_code} - {seats_response.text}")
+                    break
 
             logging.debug('Waiting for 30 seconds before processing the next organization...')
             print('Waiting for 30 seconds before processing the next organization...')
